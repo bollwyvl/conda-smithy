@@ -3,9 +3,10 @@ Messages concerning recipe files (`meta.yaml`, `recipe.yaml`).
 """
 
 from dataclasses import asdict, dataclass
-from typing import ClassVar, Literal, Self, TypeAlias
+from typing import Any, ClassVar, Literal, Self, TypeAlias
 
 from conda.deprecations import deprecated
+from rattler_build_conda_compat.jinja.jinja import render_recipe_with_context
 
 from conda_smithy.linter.messages.base import LinterMessage
 
@@ -368,16 +369,78 @@ class SourceHash(LinterMessage, _AnyRecipeMessage):
 class NoarchValue(LinterMessage, _AnyRecipeMessage):
     """
     The `build.noarch` field can only take `python` or `generic` as a value.
+    Recipe v1 also accepts a jinja expression that renders to an empty value, none, "null" or "~" to leave `noarch` unset."
     """
 
     kind = "lint"
     identifier = "R-020"
     valid: ClassVar[list[str]] = ["python", "generic"]
+    # Note that null and none literals are accepted by rattler-build, but not by the linter
+    # A jinja expression is required outside python and generic
+    valid_v1: ClassVar[list[str]] = [
+        *valid,
+        "a jinja expression that renders to an empty value, none, 'null' or '~'",
+    ]
     message = "Invalid `noarch` value `${given}`. Should be one of `${valid}`."
     given: str
+    recipe_version: RECIPE_VERSIONS
+
+    @classmethod
+    def valid_values(cls, recipe_version: RECIPE_VERSIONS) -> list[str]:
+        if recipe_version == 1:
+            return cls.valid_v1
+        return cls.valid
+
+    @classmethod
+    def rendered_value(
+        cls,
+        given: object,
+        recipe_version: RECIPE_VERSIONS,
+        meta: dict[str, Any] | None = None,
+    ) -> object | None:
+        """
+        Render the value when a jinja expression is given in v1 recipe
+        Return the given input otherwise
+        """
+        from conda_smithy.linter import conda_recipe_v1_linter
+
+        if (
+            recipe_version == 1
+            and isinstance(given, str)
+            and conda_recipe_v1_linter.JINJA_VAR_PAT.search(given)
+        ):
+            # Note that render_recipe_with_context will treat undefined variables as False
+            # due to _MissingUndefined used in jinja_env
+            rendered_value = (
+                render_recipe_with_context(meta).get("build", {}).get("noarch")
+            )
+            # An expression that renders to an empty or null-like value (`none`, `null`,
+            # `~`, or the empty string) is treated the same as omitting the `noarch`
+            # key entirely by rattler-build.
+            # The linter allows:
+            # - empty string (no else) -> rendered as None
+            # - none or None -> rendered as "None"
+            # - "none" -> rendered as "none"
+            # - "null" -> rendered as None
+            #  - "~" -> rendered as None
+            return None if rendered_value in ("none", "None") else rendered_value
+        return given
+
+    @classmethod
+    def is_valid(
+        cls,
+        given: object,
+        recipe_version: RECIPE_VERSIONS,
+        meta: dict[str, Any],
+    ) -> bool:
+        given = cls.rendered_value(given, recipe_version, meta)
+        return given is None or given in cls.valid
 
     def _render_attributes(self):
-        return {"given": self.given, "valid": ", ".join(self.valid)}
+        return {
+            "given": self.given,
+            "valid": ", ".join(self.valid_values(self.recipe_version)),
+        }
 
 
 @dataclass(kw_only=True)
@@ -1025,7 +1088,7 @@ class LegacyPyPIURL(LinterMessage, _AnyRecipeMessage):
 
 
 deprecated.constant(
-    "2026.7",
+    "2026.8",
     "2026.10",
     "UsePyPIOrg",
     LegacyPyPIURL,
@@ -1060,7 +1123,7 @@ class RedundantPythonMin(LinterMessage, _AnyRecipeMessage):
 
     kind = "hint"
     identifier = "R-052"
-    added_in = "2026.7"
+    added_in = "2026.8"
     message = (
         "The recipe sets `python_min` to ${value}, which is equal or lower "
         "than the default provided by conda-forge's global pinning. Please "
@@ -1071,6 +1134,45 @@ class RedundantPythonMin(LinterMessage, _AnyRecipeMessage):
     @classmethod
     def examples(cls) -> list[Self]:
         return [cls(value="3.9")]
+
+
+@dataclass(kw_only=True)
+class Abi3MissingAbi3Audit(LinterMessage, _AnyRecipeMessage):
+    """
+    abi3 (Python version-independent) packages are built once against
+    `python_min` but install on every later Python version. An extension
+    module that accidentally links against non-abi3 CPython API therefore
+    only fails at runtime, on a Python version the feedstock never tested.
+
+    [`abi3audit`](https://github.com/pypa/abi3audit) checks the built
+    extension modules against the declared abi3 level, so the problem is
+    caught at build time instead.
+    """
+
+    kind = "hint"
+    identifier = "R-053"
+    added_in = "2026.8"
+    message = (
+        "This recipe builds a Python version-independent (abi3) package but "
+        "does not run `abi3audit` in its tests. abi3 extension modules are "
+        "built once and installed on every later Python, so accidental use of "
+        "non-abi3 CPython API is only caught at runtime. Consider auditing the "
+        "built extension modules, as in the "
+        "[abi3 example recipe](https://github.com/conda-forge/"
+        "python-abi3-feedstock/blob/main/recipe/example-recipe.yaml):\n"
+        "```yaml\n"
+        "tests:\n"
+        "  - requirements:\n"
+        "      run:\n"
+        "        - abi3audit\n"
+        "    script:\n"
+        "      - if: unix\n"
+        "        then: abi3audit $SP_DIR/mypackage.abi3.so -s -v "
+        "--assume-minimum-abi3 ${{ python_min }}\n"
+        "        else: abi3audit %SP_DIR%/mypackage.pyd -s -v "
+        "--assume-minimum-abi3 ${{ python_min }}\n"
+        "```"
+    )
 
 
 # endregion
@@ -1263,7 +1365,7 @@ class NoarchPythonTestLatest(LinterMessage, _RecipeYamlMessage):
 
     kind = "hint"
     identifier = "R1-004"
-    added_in = "2026.7"
+    added_in = "2026.8"
     message = (
         "`noarch: python` packages install on every Python version at or "
         "above `python_min`, but the Python test only runs against a single "
@@ -1289,7 +1391,7 @@ class PythonVersionIndependentTestLatest(LinterMessage, _RecipeYamlMessage):
 
     kind = "hint"
     identifier = "R1-005"
-    added_in = "2026.7"
+    added_in = "2026.8"
     message = (
         "This package is Python version-independent (e.g. abi3): it is built "
         "once but installs on every Python version at or above `python_min`, "
@@ -1317,7 +1419,7 @@ class RattlerSPDir(LinterMessage, _RecipeYamlMessage):
 
     kind = "hint"
     identifier = "R1-006"
-    added_in = "2026.7"
+    added_in = "2026.8"
     message = (
         "This recipe handles the site-packages directory manually, either by "
         "defining `SP_DIR` itself or by hardcoding a path such as "
@@ -1351,7 +1453,7 @@ class Abi3CrossPythonRunExports(LinterMessage, _RecipeYamlMessage):
 
     kind = "hint"
     identifier = "R1-007"
-    added_in = "2026.7"
+    added_in = "2026.8"
     message = (
         "This recipe manually ignores the `python` run-export from "
         "`cross-python` via `ignore_run_exports`. This used to be required so "

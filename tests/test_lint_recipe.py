@@ -559,6 +559,86 @@ def test_lint_macdt(recipe_version, config_file):
         assert any(lint.startswith("The `MACOSX_DEPLOYMENT_TARGET`") for lint in lints)
 
 
+@pytest.mark.parametrize("noarch_value", [True, "true", "foo", "null", "none"])
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_noarch_value_invalid(recipe_version, noarch_value):
+    meta = {"build": {"noarch": noarch_value}}
+    expected = f"Invalid `noarch` value `{noarch_value}`. Should be one of"
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=recipe_version)
+    assert any(lint.startswith(expected) for lint in lints)
+
+
+@pytest.mark.parametrize("noarch_value", ["python", "generic"])
+@pytest.mark.parametrize("recipe_version", [0, 1])
+def test_noarch_value_valid(recipe_version, noarch_value):
+    meta = {"build": {"noarch": noarch_value}}
+    unexpected_lint = "Invalid `noarch` value"
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=recipe_version)
+    assert not any(lint.startswith(unexpected_lint) for lint in lints)
+
+
+def test_noarch_value_recipe_v0_rejects_conditional():
+    meta = {"build": {"noarch": '{{ "python" if use_noarch }}'}}
+    expected = 'Invalid `noarch` value `{{ "python" if use_noarch }}`. Should be one of'
+    lints, _ = linter.lintify_meta_yaml(meta)
+    assert any(lint.startswith(expected) for lint in lints)
+
+
+def test_noarch_value_recipe_v1_allows_conditional_no_context():
+    # unknown variables are rendered as False by render_recipe_with_context
+    meta = {"build": {"noarch": '${{ "python" if unknown_var }}'}}
+    unexpected_lint = "Invalid `noarch` value"
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
+    assert not any(lint.startswith(unexpected_lint) for lint in lints)
+
+
+@pytest.mark.parametrize("use_noarch", [True, False])
+@pytest.mark.parametrize("value", ["~", "null", "none", None])
+def test_noarch_value_recipe_v1_allows_rendered_conditional(use_noarch, value):
+    unexpected_lint = "Invalid `noarch` value"
+    meta = {
+        "context": {"use_noarch": use_noarch},
+        "build": {"noarch": f'${{{{ "python" if use_noarch else "{value}" }}}}'},
+    }
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
+    assert not any(lint.startswith(unexpected_lint) for lint in lints)
+
+
+@pytest.mark.parametrize("use_noarch", [True, False])
+@pytest.mark.parametrize("value", ["none", None])
+def test_noarch_value_recipe_v1_allows_rendered_conditional_value_not_quoted(
+    use_noarch, value
+):
+    unexpected_lint = "Invalid `noarch` value"
+    meta = {
+        "context": {"use_noarch": use_noarch},
+        "build": {"noarch": f'${{{{ "python" if use_noarch else {value} }}}}'},
+    }
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
+    assert not any(lint.startswith(unexpected_lint) for lint in lints)
+
+
+@pytest.mark.parametrize("use_noarch", [True, False])
+def test_noarch_value_recipe_v1_allows_rendered_conditional_no_else(use_noarch):
+    unexpected_lint = "Invalid `noarch` value"
+    meta = {
+        "context": {"use_noarch": use_noarch},
+        "build": {"noarch": '${{ "python" if use_noarch }}'},
+    }
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
+    assert not any(lint.startswith(unexpected_lint) for lint in lints)
+
+
+def test_noarch_value_recipe_v1_rejects_invalid_rendered_conditional():
+    meta = {
+        "context": {"use_noarch": True},
+        "build": {"noarch": '${{ "banana" if use_noarch else none }}'},
+    }
+    expected = 'Invalid `noarch` value `${{ "banana" if use_noarch else none }}`. Should be one of'
+    lints, _ = linter.lintify_meta_yaml(meta, recipe_version=1)
+    assert any(lint.startswith(expected) for lint in lints)
+
+
 class TestLinter(unittest.TestCase):
     def test_bad_top_level(self):
         meta = OrderedDict([["package", {}], ["build", {}], ["sources", {}]])
@@ -644,12 +724,6 @@ class TestLinter(unittest.TestCase):
 
         expected_message = "The summary item is expected in the about section."
         self.assertIn(expected_message, lints)
-
-    def test_noarch_value(self):
-        meta = {"build": {"noarch": "true"}}
-        expected = "Invalid `noarch` value `true`. Should be one of"
-        lints, hints = linter.lintify_meta_yaml(meta)
-        self.assertTrue(any(lint.startswith(expected) for lint in lints))
 
     def test_maintainers_section(self):
         expected_message = (
@@ -1310,6 +1384,22 @@ linter:
                             """,
                 is_good=True,
                 has_noarch=True,
+            )
+            assert_noarch_selector(
+                """
+                            build:
+                              noarch: ${{ "python" if use_noarch }}
+                            requirements:
+                              host:
+                                - if: use_noarch
+                                  then: python ${{ python_min }}.*
+                                  else: python
+                              run:
+                                - if: use_noarch
+                                  then: python >=${{ python_min }}
+                                  else: python
+                            """,
+                is_good=True,
             )
             assert_noarch_selector("""
                             build:
@@ -4969,6 +5059,301 @@ def test_lint_recipe_v1_abi3_cross_python_run_exports(text, expected_hint):
             f.write(text)
         _, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
         has_hint = any("run-export from `cross-python`" in h for h in hints)
+        assert has_hint == expected_hint, hints
+
+
+@pytest.mark.parametrize(
+    "recipe_name,text,expected_hint",
+    [
+        # abi3 recipe without any abi3audit usage -> hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python:
+                    version_independent: true
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - python:
+                      imports:
+                        - mypackage
+                """),
+            True,
+        ),
+        # abi3 recipe running abi3audit in a test script -> no hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python:
+                    version_independent: true
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - requirements:
+                      run:
+                        - abi3audit
+                    script:
+                      - if: unix
+                        then: abi3audit $SP_DIR/mypackage.abi3.so -s -v
+                        else: abi3audit %SP_DIR%/mypackage.pyd -s -v
+                """),
+            False,
+        ),
+        # abi3audit only declared as a test requirement -> no hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python:
+                    version_independent: true
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - requirements:
+                      run:
+                        - abi3audit
+                    script:
+                      - mypackage --help
+                """),
+            False,
+        ),
+        # example-recipe shape: conditional `is_abi3` build and host -> hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python:
+                    version_independent: ${{ is_abi3 }}
+
+                requirements:
+                  host:
+                    - if: is_abi3
+                      then: python-abi3
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - python:
+                      imports:
+                        - mypackage
+                """),
+            True,
+        ),
+        # version-independent but no `python-abi3` host dep -> not abi3, no hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python:
+                    version_independent: true
+
+                requirements:
+                  host:
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - python:
+                      imports:
+                        - mypackage
+                """),
+            False,
+        ),
+        # not version-independent -> no hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python ${{ python_min }}.*
+                  run:
+                    - python
+
+                tests:
+                  - python:
+                      imports:
+                        - mypackage
+                """),
+            False,
+        ),
+        # `noarch: python` ships no extension module -> no hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  noarch: python
+
+                requirements:
+                  host:
+                    - python ${{ python_min }}.*
+                  run:
+                    - python >=${{ python_min }}
+
+                tests:
+                  - python:
+                      imports:
+                        - mypackage
+                """),
+            False,
+        ),
+        # abi3 output without abi3audit -> hint
+        (
+            "recipe.yaml",
+            textwrap.dedent("""
+                recipe:
+                  name: mypackage
+                  version: 1.0.0
+
+                outputs:
+                  - package:
+                      name: myoutput
+                    build:
+                      python:
+                        version_independent: true
+                    requirements:
+                      host:
+                        - python-abi3
+                        - python ${{ python_min }}.*
+                      run:
+                        - python
+                    tests:
+                      - python:
+                          imports:
+                            - myoutput
+                """),
+            True,
+        ),
+        # v0 abi3 recipe without abi3audit -> hint
+        (
+            "meta.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python_version_independent: true
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python
+                  run:
+                    - python
+
+                test:
+                  imports:
+                    - mypackage
+                """),
+            True,
+        ),
+        # v0 abi3 recipe running abi3audit -> no hint
+        (
+            "meta.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                build:
+                  python_version_independent: true
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python
+                  run:
+                    - python
+
+                test:
+                  requires:
+                    - abi3audit
+                  commands:
+                    - abi3audit $SP_DIR/mypackage.abi3.so -s -v
+                """),
+            False,
+        ),
+        # v0 recipe that is not version-independent -> no hint
+        (
+            "meta.yaml",
+            textwrap.dedent("""
+                package:
+                  name: mypackage
+                  version: 1.0.0
+
+                requirements:
+                  host:
+                    - python-abi3
+                    - python
+                  run:
+                    - python
+
+                test:
+                  imports:
+                    - mypackage
+                """),
+            False,
+        ),
+    ],
+    ids=(f"recipe-{i}" for i in count(1)),
+)
+def test_lint_recipe_abi3_missing_abi3audit(recipe_name, text, expected_hint):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with open(os.path.join(tmpdir, recipe_name), "w") as f:
+            f.write(text)
+        _, hints = linter.main(tmpdir, return_hints=True, conda_forge=True)
+        has_hint = any("does not run `abi3audit`" in h for h in hints)
         assert has_hint == expected_hint, hints
 
 

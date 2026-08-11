@@ -50,7 +50,7 @@ def hint_legacy_pypi_url(sources_section: list[dict[str, Any]], hints: list[str]
             hints.append(msg.r.LegacyPyPIURL().as_string())
 
 
-@deprecated("2026.7", "2026.10", addendum="Use hint_legacy_pypi_url() instead")
+@deprecated("2026.8", "2026.10", addendum="Use hint_legacy_pypi_url() instead")
 def hint_sources_should_not_mention_pypi_io_but_pypi_org(
     sources_section: list[dict[str, Any]], hints: list[str]
 ):
@@ -534,6 +534,98 @@ def hint_abi3_cross_python_run_exports(
         from_package = flatten_v1_if_else(ignore_run_exports.get("from_package") or [])
         if any(CROSS_PYTHON_RE.match(str(entry).strip()) for entry in from_package):
             hints.append(msg.r.Abi3CrossPythonRunExports().as_string())
+            return
+
+
+def _mentions_abi3audit(test_section, recipe_version) -> bool:
+    """True if any test declares `abi3audit` as a requirement or runs it."""
+    if recipe_version == 1:
+        # v1: a list of test elements, each with `requirements.run` and `script`
+        tests = test_section or []
+    else:
+        # v0: a single mapping with `requires` and `commands`
+        tests = [test_section] if isinstance(test_section, Mapping) else []
+
+    for test in tests:
+        if not isinstance(test, Mapping):
+            continue
+        if recipe_version == 1:
+            requirements = test.get("requirements") or {}
+            reqs = (
+                requirements.get("run") or []
+                if isinstance(requirements, Mapping)
+                else []
+            )
+            commands = test.get("script")
+        else:
+            reqs = test.get("requires") or []
+            commands = test.get("commands")
+
+        for req in flatten_v1_if_else(reqs):
+            if isinstance(req, str) and req.strip().split()[:1] == ["abi3audit"]:
+                return True
+        if isinstance(commands, str):
+            commands = [commands]
+        for line in flatten_v1_if_else(commands or []):
+            if isinstance(line, str) and "abi3audit" in line:
+                return True
+    return False
+
+
+def _requires_python_abi3(requirements_section) -> bool:
+    """True if `python-abi3` is a host requirement."""
+    if not isinstance(requirements_section, Mapping):
+        return False
+    for req in flatten_v1_if_else(requirements_section.get("host") or []):
+        if isinstance(req, str) and req.strip().split()[:1] == ["python-abi3"]:
+            return True
+    return False
+
+
+def hint_abi3_missing_abi3audit(
+    test_section,
+    outputs_section,
+    build_section,
+    requirements_section,
+    recipe_version,
+    hints,
+):
+    """Hint that abi3 recipes should verify their extension modules with abi3audit.
+
+    abi3 packages are built once against `python_min` but installed on every
+    later Python, so an extension module that accidentally uses non-abi3 CPython
+    API only breaks at runtime. `abi3audit` catches that at build time.
+    """
+    tests_key = "tests" if recipe_version == 1 else "test"
+
+    scopes = []
+    if outputs_section:
+        for output in outputs_section:
+            scopes.append(
+                (
+                    output.get(tests_key),
+                    output.get("build") or {},
+                    output.get("requirements") or {},
+                )
+            )
+    else:
+        scopes.append((test_section, build_section or {}, requirements_section or {}))
+
+    for tests, build, requirements in scopes:
+        if not isinstance(build, Mapping):
+            continue
+        # `noarch: python` packages ship no compiled extension, so there is
+        # nothing for abi3audit to check
+        if build.get("noarch") == "python":
+            continue
+        if not get_version_independent(build, "python", recipe_version):
+            continue
+        # a version-independent recipe is only an abi3 recipe if it builds
+        # against `python-abi3`
+        if not _requires_python_abi3(requirements):
+            continue
+        if not _mentions_abi3audit(tests, recipe_version):
+            hints.append(msg.r.Abi3MissingAbi3Audit().as_string())
             return
 
 
