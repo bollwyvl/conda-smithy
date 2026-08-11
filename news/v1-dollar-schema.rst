@@ -4,7 +4,7 @@
 
 **Changed:**
 
-* Allow ``recipe.yaml`` to declare its schema inline with ``$schema`` instead of a comment
+* Linter: Allow ``recipe.yaml`` to declare its schema inline with ``$schema`` instead of a comment. (#2617)
 
 **Deprecated:**
 
