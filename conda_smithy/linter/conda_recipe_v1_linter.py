@@ -38,6 +38,7 @@ EXPECTED_MULTIPLE_OUTPUT_SECTION_ORDER = [
     "recipe",
     "source",
     "build",
+    "tests",
     "outputs",
     "about",
     "extra",
